@@ -21,12 +21,14 @@ public:
     // 建構子：跟系統挖地，然後當場切豆腐
     SimpleMemoryPool() {
         // 總共挖 96 字節（可以切出 3 塊 32 字節的豆腐）
-        rawMemory = new char[96]; 
+       // rawMemory = new char[96]; 
+        rawMemory = reinterpret_cast<char*>(std::malloc(96));
 
         // 💥 開始切豆腐！利用指標算術（Pointer Arithmetic）算出每塊豆腐的記憶體地址
         Node* block1 = reinterpret_cast<Node*>(rawMemory);       // 第 1 塊：位元組 0
         Node* block2 = reinterpret_cast<Node*>(rawMemory + 32);  // 第 2 塊：位元組 32
         Node* block3 = reinterpret_cast<Node*>(rawMemory + 64);  // 第 3 塊：位元組 64
+
 
         // 💥 讓豆腐手牽手，串成鏈表！這就是你這週在 LeetCode 練的鏈表串接
         block1->next = block2;
@@ -76,30 +78,44 @@ public:
 
     // 解構子：要把跟系統借的大地還給人家，不然會 Memory Leak
     ~SimpleMemoryPool() {
-        delete[] rawMemory;
+      // delete[] rawMemory;
+       free(rawMemory);
         cout << "\n[Finish] Memory take back success, finish！\n";
     }
 };
-
+SimpleMemoryPool* global_pool = nullptr;
+void* operator new(size_t size){
+    cout << "global interrupt, someone call new, apply space: " << size << "bytes" << endl;
+    if(global_pool != nullptr && size <= 32){
+        cout << "->[Memory pool] detected fit space, cut one tofu out" << endl;
+        return global_pool -> allocate();
+    }
+    //if not fit(greater than 32 bytes), or memory pool is not allocated yet, return original malloc
+    cout <<"-> [system defense] memory space is not fit or not allocated yet, return original malloc" << endl;
+    return malloc(size);
+}
+void operator delete(void* address) noexcept{
+    cout <<"[global interrupt] Someone call delete, free memory address: " << address << endl;
+    if(global_pool != nullptr && address != nullptr){
+        cout <<"<- [Memory pool] interrupt success, return to Tofu list" << endl;
+        global_pool -> deallocate(address);
+        return;
+    }
+    free(address);
+}
 int main() {
     // 啟動我們的實驗記憶體池
     SimpleMemoryPool pool;
+    global_pool = &pool; //Let global_pool catch pool
     cout << "start to borrow memroy and put player info in memory" << endl;
-    void* memory1 = pool.allocate();
-    Player* player1 = new (memory1) Player{19,200,400,"vicky"};
-    void* memory2 = pool.allocate();
-    Player* player2 = new (memory2) Player{48,500,300,"Leo"};
+    Player* player1 = new  Player{19,200,400,"vicky"};
+    Player* player2 = new  Player{48,500,300,"Leo"};
     cout << "Check player info in memory correctly" <<endl;
     cout << "player1 name:" << player1 -> name << "| HP:" << player1 -> hp << "| MP:" << player1 -> mp << "|id:" << player1 -> id << "| address:" << player1 << endl;
     cout << "player2 name:" << player2 -> name << "| HP:" << player2 -> hp << "| MP:" << player2 -> mp << "|id:" << player2 -> id << "| address:" << player2 << endl;
-    cout << "Test return address from plater2" << endl; 
-    player2->~Player();
-    pool.deallocate(memory2);
-    cout << "put new player in the return address" << endl;
-    void* memory3 = pool.allocate();
-    Player* player3 = new (memory3) Player{4819,700,400,"Trout"};
-    cout << "player3 name:" << player3 -> name << "| HP:" << player3 -> hp << "| MP:" << player3 -> mp << "|id:" << player3 -> id << "| address:" << player3 << endl;
-    cout << "check if trout address is same as Leo" << endl;
+    cout << "Test return address " << endl; 
+    delete player1;
+    delete player2;
     cout << "end the code" << endl;
     
     return 0;

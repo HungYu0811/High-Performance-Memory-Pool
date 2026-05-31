@@ -1,12 +1,17 @@
 #include <iostream>
 #include <cstddef> // 為了使用 size_t
-
+using namespace std;
 // 1. 定義豆腐塊的骨架（車廂）
 // 當這塊記憶體沒人用的時候，它裡面要塞一個指標，用來指向下一塊空閒豆腐
 struct Node {
     Node* next;
 };
-
+struct Player{
+    int id;
+    int hp;
+    int mp;
+    string name;
+};
 class SimpleMemoryPool {
 private:
     char* rawMemory;     // 儲存整塊大記憶體的起點
@@ -30,13 +35,13 @@ public:
 
         // 車頭停在第一塊豆腐
         freeListHead = block1;
-        std::cout << "[init] cut 96 untit tofu cut in 3 pieces   ，head of the link list is at " << freeListHead << "\n\n";
+        cout << "[init] cut 96 untit tofu cut in 3 pieces   ，head of the link list is at " << freeListHead << "\n\n";
     }
 
     // 2. 借出豆腐 (Allocate) -> 等同於 LeetCode 的「移出頭節點」
     void* allocate() {
         if (freeListHead == nullptr) {
-            std::cout << "[Error] Run out of memory ！Cannot alllocate.\n";
+            cout << "[Error] Run out of memory ！Cannot alllocate.\n";
             return nullptr;
         }
 
@@ -46,7 +51,7 @@ public:
         // 💥 快慢指標的位移！車頭退一步，指向下一塊空閒豆腐
         freeListHead = freeListHead->next;
 
-        std::cout << " -> lend one peace of tofu, address : " << chunkToBorrow 
+        cout << " -> lend one peace of tofu, address : " << chunkToBorrow 
                   << " | Next tofu is at : " << freeListHead << "\n";
         
         return reinterpret_cast<void*>(chunkToBorrow);
@@ -65,33 +70,37 @@ public:
         // 讓車頭重新停在剛剛歸還的這個節點上
         freeListHead = returnedChunk;
 
-        std::cout << " <- Customer return the tofu, address : " << address 
+        cout << " <- Customer return the tofu, address : " << address 
                   << " | Now new head of the list is : " << freeListHead << "\n";
     }
 
     // 解構子：要把跟系統借的大地還給人家，不然會 Memory Leak
     ~SimpleMemoryPool() {
         delete[] rawMemory;
-        std::cout << "\n[Finish] Memory take back success, finish！\n";
+        cout << "\n[Finish] Memory take back success, finish！\n";
     }
 };
 
 int main() {
     // 啟動我們的實驗記憶體池
     SimpleMemoryPool pool;
-
-    // 模擬程式運作，開始借豆腐
-    std::cout << "--- Test start：apply memory frequently ---\n";
-    void* p1 = pool.allocate();
-    void* p2 = pool.allocate();
-    void* p3 = pool.allocate();
-    void* p4 = pool.allocate(); // 這一個應該會失敗，因為我們只切了 3 塊
-
-    std::cout << "\n--- Test ：return memory ---\n";
-    pool.deallocate(p2); // 還回第 2 塊豆腐
+    cout << "start to borrow memroy and put player info in memory" << endl;
+    void* memory1 = pool.allocate();
+    Player* player1 = new (memory1) Player{19,200,400,"vicky"};
+    void* memory2 = pool.allocate();
+    Player* player2 = new (memory2) Player{48,500,300,"Leo"};
+    cout << "Check player info in memory correctly" <<endl;
+    cout << "player1 name:" << player1 -> name << "| HP:" << player1 -> hp << "| MP:" << player1 -> mp << "|id:" << player1 -> id << "| address:" << player1 << endl;
+    cout << "player2 name:" << player2 -> name << "| HP:" << player2 -> hp << "| MP:" << player2 -> mp << "|id:" << player2 -> id << "| address:" << player2 << endl;
+    cout << "Test return address from plater2" << endl; 
+    player2->~Player();
+    pool.deallocate(memory2);
+    cout << "put new player in the return address" << endl;
+    void* memory3 = pool.allocate();
+    Player* player3 = new (memory3) Player{4819,700,400,"Trout"};
+    cout << "player3 name:" << player3 -> name << "| HP:" << player3 -> hp << "| MP:" << player3 -> mp << "|id:" << player3 -> id << "| address:" << player3 << endl;
+    cout << "check if trout address is same as Leo" << endl;
+    cout << "end the code" << endl;
     
-    // 重複利用！再申請一次，這時候你應該會看到它拿到「剛剛 p2 還回來的那塊地址」
-    void* p5 = pool.allocate(); 
-
     return 0;
 }

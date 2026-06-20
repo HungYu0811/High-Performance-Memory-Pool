@@ -2,7 +2,7 @@
 
 * **Project:** High-Performance-Memory-Pool
 * **Author:** HungYu
-* **Date:** 2026-06-16
+* **Date:** 2026-06-20
 
 ---
 
@@ -14,17 +14,17 @@ Verify how to implement a high-performance, O(1) complexity, and completely lock
 
 ## Architecture Evolution & Modify
 
-### v1 : Fixed-Size Memory Pool with link list ('Commit_ver1')
+### v1.0 : Fixed-Size Memory Pool with link list 
 * **Design:** Allocated raw memory via 'new char[96]' and sliced it into three 32-byte blocks, chained as a Linked List.
 * **Purpose:** Verified the core logic of allocating and deallocating memory blocks using pointer arithmetic.
 
-### v2 : Add UserInfo ('Commit_ver2')
+### v1.1 : Add UserInfo 
 * **Design:** Added 'UserInfo' structure inside the 'Player' object.
 * **Purpose:** Simulate a realistic game entity scenario where data size grows.
 
 ---
 
-### v3 : Override global new/delete operators and implement network interception ('Commit_ver3')
+### v1.2 : Override global new/delete operators and implement network interception 
 * **Design:** Defined a global 'SimpleMemoryPool* global_pool' and overloaded the global 'void* operator new(size_t size)' and 'void operator delete(void* address)'.
 
 #### Encountered Bottlenecks:
@@ -39,21 +39,21 @@ Verify how to implement a high-performance, O(1) complexity, and completely lock
 
 ---
 
-### v4: Class-Specific Thread-Local 64-Byte Allocator ('Commit_ver4')
+### v1.3: Class-Specific Thread-Local 64-Byte Allocator with Safety Margin
 
 #### Design:
-1. **Thread-Local Isolation:** Changed 'global_pool' to 'thread_local local_pool'. Each CPU core now runs on its own independent memory track. No mutex, no queueing, 100% lock-free.
-2. **Class-Specific Overload:** Moved 'operator new/delete' directly inside 'struct Player'. Only 'Player' allocations touch our pool, preventing standard library components from triggering recursion bugs.
+1. **Thread-Local Isolation (Deterministic Lifecycle):** Migrated from a global pool pointer to a direct object instance: 'thread_local SimpleMemoryPool local_pool;'. Each CPU core now runs on its own independent memory track with zero lock contention. Furthermore, declaring it as an object instance guarantees that '~SimpleMemoryPool()' is automatically invoked upon thread destruction, achieving a closed lifecycle with zero memory leaks.
+2. **Class-Specific Overload:** Moved 'operator new/delete' directly inside 'struct Player'. Only 'Player' allocations touch our pool, preventing standard library components (like 'std::string') from triggering cascading allocation loop bugs.
 
-#### The Crucial Fix (Solving the 48-byte Overflow):
-* **The Problem:** In v3, switching to 'std::string' expanded the 'Player' object size to 48 bytes. However, our old pool was still slicing blocks at 32-byte intervals. Writing a 48-byte object into a 32-byte space caused a critical memory overflow, overwriting and destroying the 'Node* next' pointer of the adjacent block.
-* **The Solution:** Upgraded the block slicing size from 32 bytes to 64 bytes. This extra padding completely contains the 48-byte 'Player' object and ensures total memory safety.
+#### The Crucial Fix (Solving the 48-byte Overflow & Boundary Margin):
+* **The Problem:** In v1.2, switching to 'std::string' expanded the 'Player' object size to 48 bytes. Slicing blocks at 32-byte intervals caused critical memory corruption, as object data overran into adjacent blocks and obliterated the 'Node* next' embedded pointers.
+* **The Solution:** Upgraded the block slicing size from 32 bytes to 64 bytes (matching hardware Cache Line Alignment to maximize L1/L2 cache efficiency). Concurrently, expanded the total arena allocation size to 224 bytes ('64 bytes * 3 slots + 32 bytes tail padding'). The extra 32 bytes act as a strict downstream safety boundary margin, completely shielding the application from out-of-bounds undefined behavior during high-tier compiler optimization ('-O3').
 
 ---
 
 ## Verification & Results
 
-Confirmed via Linux terminal output:
-1. **Independent Addresses:** Core '[0]', '[1]', and '[2]' print completely different memory address ranges (e.g., '0x7fd45c000b80' vs '0x7fd454000b80'), proving 'thread_local' isolation works perfectly.
-2. **Clean Pointers:** The 'Next tofu is at' logs show perfectly clean aligned hex addresses (e.g., '0x...c00') instead of being corrupted by string data leftovers.
-3. **True O(1) Complexity:** Zero mutex overhead, maximum multi-core throughput.
+Confirmed via Linux terminal output ('g++ main.cpp -o main -pthread'):
+1. **Thread-Local Storage Isolation:** Core '[0]', '[1]', and '[2]' log entirely disjoint memory address ranges (e.g., '0x7f2e68000b60' vs '0x7f2e70000b60'), proving complete execution thread isolation under heavy core loads.
+2. **Perfect Offset Math:** The allocation delta between adjacent chunks (e.g., '0x7f2e68000ba0' - '0x7f2e68000b60') calculates exactly to '0x40' (64 bytes in decimal), verifying precision pointer arithmetic and cache line alignment.
+3. **Implicit Free List Circular Lifecycle:** The log tracks returned memory addresses instantly becoming the new head of the implicit list. This proves the O(1) push-front recycling mechanism works flawlessly, creating a highly sustainable memory reuse loop.

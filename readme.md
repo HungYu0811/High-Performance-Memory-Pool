@@ -51,7 +51,7 @@ Verify how to implement a high-performance, O(1) complexity, and completely lock
 
 ---
 
-## Verification & Results
+## Verification & Results 
 
 Confirmed via Linux terminal output ('g++ main.cpp -o main -pthread'):
 1. **Thread-Local Storage Isolation:** Core '[0]', '[1]', and '[2]' log entirely disjoint memory address ranges (e.g., '0x7f2e68000b60' vs '0x7f2e70000b60'), proving complete execution thread isolation under heavy core loads.

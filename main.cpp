@@ -139,7 +139,6 @@ struct Player{
     static void* operator new(size_t size) {
         return local_pool.allocate();
     }
-
     /**
      * Operator delete Overload
      * Safely routes memory addresses directly back into the originating TLS pool object scope.

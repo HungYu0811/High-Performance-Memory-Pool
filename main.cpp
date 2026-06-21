@@ -6,6 +6,7 @@
 #include <vector>
 #include <mutex>
 #include <atomic>
+#include <new>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -79,14 +80,11 @@ public:
 
 // Global Central Arena Singleton Instance - Allocating 400MB Virtual Buffer Space
 CentralArena g_centralArena(400 * 1024 * 1024);
-
 /**
- * Fixed-Size Memory Pool (Arena Allocator)
- * Rationale:
- * 1. Pre-allocates a continuous chunk of heap memory to eliminate frequent runtime
- * system calls (malloc), reducing context switches and kernel-mode transitions.
- * 2. Manages memory distribution via a Free List with O(1) time complexity.
+ * Template-Based Fixed-Size Memory Pool
+ * Automatically scales block sizes to match hardware Cache Line limits based on DataType.
  */
+template <typename T>
 class SimpleMemoryPool {
 private:
     char* rawMemory;       // Start address of the segregated 64KB continuous territory
@@ -107,8 +105,8 @@ public:
             std::cout << "[init] thread " << std::this_thread::get_id()
                       << " Build personal thread, start from " << (void*)rawMemory << "\n";
         }
-        
-        size_t blockSize = 64;
+        //Dynamically calculate object size and round up to 64-byte Cache Line Alignment
+        size_t blockSize = (sizeof(T) + 63) & ~63; 
         size_t maxSlots = (myChunkSize - 64) / blockSize; // Reserves a conservative 64-byte safe-padding downstream
 
         freeListHead = (Node*)rawMemory;
@@ -156,17 +154,14 @@ public:
 };
 
 /**
- * Thread-Local Storage (TLS) Strategy
- * Architectural Impact (Critical):
- * Instantiates an isolated static object instance of the Memory Pool for every executing thread.
- * Rationale:
- * 1. Confines allocations to a thread's local storage boundary to bypass all lock primitives (Lock-Free).
- * 2. Declaring as an object instead of a pointer guarantees that the compiler automatically invokes
- * the destructor (~SimpleMemoryPool) upon thread destruction, establishing a closed lifecycle with zero leaks.
- * 3. Leverages Lazy Initialization automatically provided by the C++ TLS runtime spec.
+ * User Network Request Simulation Packet
  */
-thread_local SimpleMemoryPool local_pool;
-
+struct UserRequest {
+    int id;
+    int hp;
+    int mp;
+    string name;
+};
 struct Player {
     int id;
     int hp;
@@ -181,63 +176,77 @@ struct Player {
              << ", MP: " << mp << ") | Memory Address: " << this << "\n";
     }
     
-    /**
-     * Operator new Overload
-     * Intercepts standard runtime heap routing. Instead of calling global new,
-     * it reroutes to the calling thread's local TLS pool instance.
-     */
-    static void* operator new(size_t size) {
-        return local_pool.allocate();
-    }
-
-    /**
-     * Operator delete Overload
-     * Safely routes memory addresses directly back into the originating TLS pool object scope.
-     */
-    static void operator delete(void* address) noexcept {
-        if (address != nullptr) {
-            local_pool.deallocate(address);
-        }
-    }
 };
 
-// Worker entry point representing independent CPU Execution Cores
-void game_core_worker(int core_id) {
+// Instantiating the generic pool explicitly bound to the Player structure size metrics
+thread_local SimpleMemoryPool<Player> local_player_pool;
+
+/**
+ * Dynamic Worker Loop
+ * Processes variable workload streams dynamically according to vector request payloads.
+ */
+void game_core_worker(int core_id, std::vector<UserRequest> requests) {
     {
         lock_guard<mutex> lock(cout_mtx);
-        cout << ">>> CPU Core [ " << core_id << "] Start execution game logic...\n";
+        cout << ">>> CPU Core [ " << core_id << "] Processing " << requests.size() << " user packets...\n";
     }
     
-    // Memory metrics bound directly within the aligned virtual segments
-    Player* p1 = new Player{core_id, 100, 50, "Leo"};
-    p1->print_info(core_id);
-    Player* p2 = new Player{core_id + 10, 200, 80, "Vicky"};
-    p2->print_info(core_id);
+    std::vector<Player*> active_players;
+
+    // Dynamically constructing arbitrary numbers of entities requested by the user flow
+    for (const auto& req : requests) {
+        // Step 1: Claim raw cache-aligned slot from TLS pool
+        void* mem = local_player_pool.allocate();
+        
+        // Step 2: Placement new runtime execution - maps runtime variables on memory precisely
+        Player* p = ::new (mem) Player{req.id, req.hp, req.mp, req.name};
+        
+        p->print_info(core_id);
+        active_players.push_back(p);
+    }
     
-    // Fully unlocked high performance deletion pipelines
-    delete p1;
-    delete p2;
+    // Controlled destruction tear-down loop
+    for (auto* p : active_players) {
+        p->~Player();                  // Manually release internal heap assets (std::string inner buffer)
+        local_player_pool.deallocate(p); // Recycle back to the local free list
+    }
     
     {
         lock_guard<mutex> lock(cout_mtx);
-        cout << "<<< CPU Core [" << core_id << "] Execution complete.\n";
+        cout << "<<< CPU Core [" << core_id << "] Workload processed successfully.\n";
     }
 }
-
 int main() {
-    cout << "=== Start Game Server, prepare 3 CPU Cores ===\n\n";
+    cout << "=== Start Dynamically Scaled Game Server, Preparing Cores ===\n\n";
+    
+    // 💡 Simulating dynamic user load profiles on different cores
+    std::vector<UserRequest> core0_payload = {
+        {101, 100, 50, "Dynamic_Leo"},
+        {102, 120, 60, "Dynamic_Vicky"}
+    };
+
+    std::vector<UserRequest> core1_payload = {
+        {201, 999, 888, "Boss_Sephiroth"},
+        {202, 150, 200, "Mage_Aerith"},
+        {203, 300, 100, "Warrior_Cloud"} // Core 1 dynamically requests 3 players!
+    };
+
+    std::vector<UserRequest> core2_payload = {
+        {301, 50, 10, "Goblin_A"} // Core 2 dynamically requests only 1 monster!
+    };
+
     vector<thread> cpu_cores;
     
-    // Distribute workloads concurrently across multiple runtime threads
-    for(int i = 0; i < 3; ++i) {
-        cpu_cores.push_back(thread(game_core_worker, i));
-    }
+    // Dispatching variable task bundles across individual pipeline workers
+    cpu_cores.push_back(thread(game_core_worker, 0, core0_payload));
+    cpu_cores.push_back(thread(game_core_worker, 1, core1_payload));
+    cpu_cores.push_back(thread(game_core_worker, 2, core2_payload));
     
-    // Join threads to block until execution completes, reclaiming OS resources
     for (auto& core : cpu_cores) {
         core.join();
     }
     
-    cout << "\n=== All core finish, perfect thread-local no lock distribute success ! ===\n";
+    cout << "\n=== All dynamic payloads processed successfully under pure lock-free isolation! ===\n";
     return 0;
 }
+

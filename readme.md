@@ -66,7 +66,7 @@ An exploration of how to implement a custom, O(1) complexity, thread-aware memor
 5. **Diagnostic logging** uses `std::this_thread::get_id()` to cross-reference kernel-scheduled threads against the addresses they receive.
 
 #### Known code-level issues in this version:
-* `size_t maxSlots = (myChunkSize - 64) / blockSize;` is commented as "扣掉尾巴 32 節安全緩衝" (subtracting a 32-unit tail safety margin), but the code actually subtracts 64, not 32 — comment and code disagree; needs reconciling.
+* `size_t maxSlots = (myChunkSize - 64) / blockSize;` is commented as subtracting a "32-unit tail safety margin," but the code actually subtracts 64, not 32 — comment and code disagree; needs reconciling.
 * `blockSize` is hardcoded to `64` in this version, not derived from `sizeof(T)`. The 64-byte alignment here is a fixed constant chosen in advance, not yet a computed property of the type being stored — that generalization is what v1.5 actually introduces. This version should not be described as doing "cache-aligned sizing" in the dynamic sense; it's a fixed, pre-chosen cache-line-sized block.
 * `allocate()` now throws `std::bad_alloc()` on exhaustion (an improvement over v1.3's silent `nullptr`), but nothing in `game_core_worker` catches it — an exhausted pool would currently terminate the program via an uncaught exception rather than degrading gracefully.
 

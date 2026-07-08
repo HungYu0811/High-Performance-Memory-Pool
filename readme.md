@@ -2,7 +2,7 @@
 
 * **Project:** High-Performance-Memory-Pool
 * **Author:** HungYu
-* **Date:** 2026-07-08
+* **Date:** 2026-06-20
 * **Status:** Work in progress / learning project — see [Known Limitations](#known-limitations) below.
 
 ---

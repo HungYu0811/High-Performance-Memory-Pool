@@ -33,6 +33,17 @@ An exploration of how to implement a custom, O(1) complexity, thread-aware memor
 2. **Program-wide interception risk:** Because `operator new`/`operator delete` were overridden globally (not scoped to `Player`), *every* allocation in the program — including internal STL allocations — passed through this hook and its `size <= 32` check. Any unrelated allocation that happened to be ≤ 32 bytes could be misrouted into the pool, which has no way to know the memory didn't actually hold a `Player`. This is a broader risk than just "multithread contention," and is one of the motivations for the class-specific override in v1.3.
 3. **The "Phantom 3rd Delete" (Self-Interception):** Inside `~SimpleMemoryPool()`, `delete[] rawMemory;` triggered the same global `operator delete` hook, causing the pool to intercept its own teardown and log an unexpected 3rd delete pointing at the pool's base address.
 4. **Size/alignment discrepancy carried over from v1.1:** `sizeof(Player)` needs to be verified against the actual block size on the build platform — this was not directly measured in code (no `sizeof(Player)` print), so whether this version's demo allocations actually went through the pool branch or fell through to `malloc` (the `size <= 32` guard) depends on the actual compiled size.
+5. **⚠️ Verified: `operator new` and `operator delete` use asymmetric logic, causing a real allocator/deallocator mismatch.** Testing on this codebase confirmed `sizeof(Player) = 48`, so `operator new`'s `size <= 32` guard correctly routes `Player` allocations to `malloc`, not the pool — the pool was never actually exercised by `Player` in this version's demo. However, `operator delete` has no equivalent size check:
+   ```cpp
+   void operator delete(void* address) noexcept{
+       if(global_pool != nullptr && address != nullptr){
+           global_pool -> deallocate(address);
+           return;
+       }
+       free(address);
+   }
+   ```
+   This means a `Player*` that was allocated via `malloc` (because it didn't fit the pool) still gets sent to `global_pool->deallocate()` on `delete`, inserting a `malloc`-owned 48-byte block into a free list built for 32-byte pool blocks. The pool has no way to know this memory doesn't actually belong to it. In this demo the program exits immediately afterward, so the mismatch doesn't visibly corrupt anything, but this is a real allocator/deallocator asymmetry — allocation is guarded by size, deallocation is not — that would cause real memory corruption if the pool were reused afterward (e.g., another `allocate()` call handing out this same address as if it were a valid 32-byte pool block).
 
 #### The Solution & Refactoring:
 * Replaced `delete[] rawMemory` with `std::free(rawMemory)` in the destructor, and `new char[96]` with `std::malloc(96)` in the constructor, to keep allocation/deallocation calls paired correctly (mixing `new[]`/`free` is undefined behavior) and to stop the pool's own teardown from re-triggering the global `delete` hook.

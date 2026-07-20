@@ -13,6 +13,23 @@ An exploration of how to implement a custom, O(1) complexity, thread-aware memor
 
 ---
 
+## Build
+
+This project uses a plain `Makefile` (no CMake required).
+
+```bash
+make            # Release: build `main` and `benchmark` (no logging, -O2)
+make debug      # same targets, but defines POOL_DEBUG_LOG (prints [init]/[Pool] logs)
+make clean      # remove built executables
+./main          # run the demo (thread-local pool, prints player addresses)
+./benchmark     # run the v1.7 benchmark (allocator vs system allocator)
+```
+
+* Requires a C++17 compiler and pthreads: `g++` (Linux) or MinGW-w64 / MSYS2 / WSL (Windows). On Linux `make` is available natively; on Windows you need MinGW-w64 / MSYS2 / WSL to provide both `make` and `g++`.
+* The `Makefile` recipe lines must be indented with **Tab**, not spaces — watch this if you copy the file across editors.
+
+---
+
 ## Architecture Evolution & Modify
 
 ### v1.0 : Fixed-Size Memory Pool with Linked List
@@ -100,16 +117,16 @@ An earlier draft of this version used `thread_local SimpleMemoryPool* local_pool
 ### v1.6 : Debug-Gated Logging + Bounds-Checked Free + Chunk Reclamation + Dynamic Pool Growth
 
 #### Design / Fixes (relative to v1.5):
-1. **Hot-path logging gated behind `POOL_DEBUG_LOG`:** The `std::cout` + `cout_mtx` log blocks inside `allocate()` and `deallocate()` are now wrapped in `#ifdef POOL_DEBUG_LOG`, so a release build (`g++ main.cpp -o main -pthread`, no define) runs the hot path with zero logging overhead. The one-time `[init]` log emitted from `grow_pool()` is *also* gated behind `POOL_DEBUG_LOG`, so a release build produces no pool diagnostic output at all.
+1. **Hot-path logging gated behind `POOL_DEBUG_LOG`:** The `std::cout` + `cout_mtx` log blocks inside `allocate()` and `deallocate()` are now wrapped in `#ifdef POOL_DEBUG_LOG`, so a release build runs the hot path with zero logging overhead. The one-time `[init]` log emitted from `grow_pool()` is also gated behind `POOL_DEBUG_LOG`.
 2. **Bounds-checked `deallocate()`:** `deallocate()` now walks `memory_list` and only accepts the address if (a) it falls inside one of the pool's owned chunks, (b) its offset from the chunk base is a multiple of `blockSize` (alignment check — rejects mid-block frees), and (c) that offset is `< myChunkSize - 64` (rejects the trailing 64-byte tail-padding region, which holds no valid block). A misdirected free that fails any of these is silently ignored (`return`) instead of corrupting the free list. Double-free of a *valid* block is still not detected (would require a separate in-use bitmap; deferred as out of scope for a learning project).
 3. **Chunk reclamation — `CentralArena` offset is no longer monotonic:** `CentralArena` now keeps a `freeCentralHead` free list of returned chunks. `SimpleMemoryPool` owns a `std::vector<char*> memory_list` of every chunk it claimed, and its destructor calls `CentralArena::returnChunk(chunk)` for each — pushing the chunk back onto `freeCentralHead`. `requestChunk()` now prefers recycling a returned chunk from `freeCentralHead` before advancing `offset`. This fixes the v1.5 reclamation gap: a thread that exits returns its chunks to the arena for reuse, so `offset` no longer climbs unboundedly in a long-running server that spawns/joins threads.
 4. **Dynamic pool growth — `grow_pool()`:** When `allocate()` finds an empty free list, it calls `grow_pool()`, which requests another 64KB chunk from `CentralArena`, appends it to `memory_list`, builds a fresh embedded free list inside it, and splices that new list's tail onto the previous free list (`current->next = temp_free_list`) — O(1) cross-chunk merge. The pool no longer throws `std::bad_alloc` on exhaustion; it grows instead (only throwing if `CentralArena` itself is out of space).
 
 #### Code-level hardening in v1.6:
-* **Overflow guard added to `grow_pool()`:** `blockSize = (sizeof(T) + 63) & ~63;` is computed *before* any use, and `if (blockSize > myChunkSize - 64) throw std::bad_alloc();` guards the subsequent `maxSlots = (myChunkSize - 64) / blockSize;` loop. This closes the v1.5 latent unsigned-underflow: with `blockSize > myChunkSize - 64` (e.g. a `T` larger than ~64KB), `maxSlots` would have been `0` and `maxSlots - 1` would underflow to `SIZE_MAX`, causing the build loop to scribble past the chunk. The guard is placed *after* `blockSize` is assigned, so the first (constructor) call is protected too — an earlier draft that checked `blockSize` before assigning it read an uninitialized member (UB) and was rejected.
+* **Overflow guard added to `grow_pool()`:** `blockSize = (sizeof(T) + 63) & ~63;` is computed *before* any use, and `if (blockSize > myChunkSize - 64) throw std::bad_alloc();` guards the subsequent `maxSlots = (myChunkSize - 64) / blockSize;` loop. This closes the v1.5 latent unsigned-underflow: with `blockSize > myChunkSize - 64` (e.g. a `T` larger than ~64KB), `maxSlots` would have been `0` and `maxSlots - 1` would underflow to `SIZE_MAX`, causing the build loop to scribble past the chunk. The guard is placed *after* `blockSize` is assigned, so the first (constructor) call is protected too.
 
 #### Locking characterization in v1.6 (refines the "lock-free" claim):
-* The `allocate()`/`deallocate()` hot path is **lock-free only while the calling thread is still consuming blocks from a chunk it already owns**. The moment a thread exhausts its current chunk and `grow_pool()` runs, it takes `arena_mtx` inside `CentralArena::requestChunk()`. So the correct statement is: *lock-free on the steady-state hot path; mutex-protected on the one-time bootstrap **and** on every chunk-growth event.* It is not "pure lock-free" even in the steady state if growth is happening.
+* The `allocate()`/`deallocate()` hot path is **lock-free only while the calling thread is still consuming blocks from a chunk it already owns**. The moment a thread exhausts its current chunk and `grow_pool()` runs, it takes `arena_mtx` inside `CentralArena::requestChunk()`. So the correct statement is: *lock-free on the steady-state hot path; mutex-protected on the one-time bootstrap **and** on every chunk-growth event.*
 
 #### Known limitations carried into this version (relative to v1.5):
 * **Resolved:** No dynamic arena growth — now handled by `grow_pool()`.
@@ -120,41 +137,79 @@ An earlier draft of this version used `thread_local SimpleMemoryPool* local_pool
 
 ---
 
+### v1.7 : Build System + First Quantitative Benchmark
+
+#### Design / Changes (relative to v1.6):
+1. **Build system:** Added a plain `Makefile` that builds two targets — `main` (the demo) and `benchmark` (the new performance harness) — in one `make` invocation. `POOL_DEBUG_LOG` is no longer toggled by a hand-typed `-D` flag; instead `make debug` appends `-DPOOL_DEBUG_LOG` (plus `-Wall -Wextra`), while the default `make` builds a clean Release (`-O2`, no logging). This replaces the ad-hoc `g++ ... -DPOOL_DEBUG_LOG` workflow with a repeatable, single-command build.
+2. **First benchmark (`benchmark.cpp`):** A standalone harness (self-contained copy of `CentralArena`/`SimpleMemoryPool`, no dependency on `main.cpp`) that measures allocation throughput against the system allocator. It runs two scenarios:
+   * **Single-threaded** — pool vs `new`/`delete` for a fixed number of iterations. The iteration count deliberately exceeds one 64KB chunk (1023 slots), forcing `grow_pool()` to fire and thereby exercising the v1.6 dynamic-growth path under real execution.
+   * **Multi-threaded** — one thread-local pool per hardware thread vs the system allocator, same allocate→construct→destroy→deallocate loop, reporting aggregate throughput.
+
+#### Verified benchmark results (Linux, 6 hardware threads, Release build):
+
+```
+[A] single-threaded (forces cross-chunk growth)
+  [single] pool            20000 iters   172.007 Mops/sec
+  [single] system          20000 iters    61.241 Mops/sec
+
+[B] multi-threaded (per-thread TLS pool vs system allocator)
+  [multi ] pool        6 threads     300000 total   311.500 Mops/sec
+  [multi ] system      6 threads     300000 total   254.013 Mops/sec
+```
+
+* **Single-threaded:** the pool is **~2.81× faster** than `new`/`delete`. The system allocator pays per-call lock + bookkeeping overhead on every allocation; the pool's hot path is an O(1), lock-free push/pop.
+* **Multi-threaded:** the pool is **~1.23× faster** than the system allocator. Modern glibc `malloc` is itself per-thread (thread caches), so its multi-threaded contention is already low and the pool's advantage narrows — but the pool still wins.
+* **Side effect:** the single-threaded run allocates 20000 `Player` objects (>1023 slots/chunk), so `grow_pool()` is guaranteed to have executed at least once during the run — confirming the v1.6 dynamic-growth path works at runtime, not just at compile time.
+
+#### Honest scope of these numbers (do not over-read):
+* This is a **microbenchmark in the allocator's most favorable regime**: fixed 48-byte objects, allocation-dominated tight loops, one type per pool. Real workloads (mixed sizes, large objects, non-allocation-bound logic) will show a smaller — possibly absent — advantage.
+* `Mops/sec` includes `Player` construction + destruction (`std::string` bookkeeping); both sides pay that equally, so the delta is attributable to the allocator, but these are **not** pure allocator-only timings.
+* Only throughput is measured. Latency distribution, false-sharing behavior, and long-running growth/reclaim churn have **not** been measured.
+
+#### Known limitations carried into this version (relative to v1.6):
+* **Resolved:** No benchmark suite — v1.7 adds `benchmark.cpp` with real measured numbers.
+* **Resolved (partially):** Debug/release split — `make debug` vs `make` now controls `POOL_DEBUG_LOG`; still a single macro gate, not a CMake/IDE target, but the hand-typed `-D` is gone.
+* **Still open:** double-free detection (deferred); `fetch_add` fully-lock-free arena (deferred); latency/false-sharing/churn instrumentation (deferred).
+
+---
+
 ## Verification & Results
 
 Confirmed via Linux terminal output (`g++ main.cpp -o main -pthread`):
 
 1. **Thread-Local Storage Isolation:** Cores `[0]`, `[1]`, and `[2]` log entirely disjoint memory address ranges (e.g., `0x7f2e68000b60` vs `0x7f2e70000b60`), consistent with each thread receiving its own arena sub-chunk.
-2. **Offset math:** The allocation delta between adjacent blocks within a pool (e.g., `0x7f2e68000ba0 - 0x7f2e68000b60`) is exactly `0x40` (64 bytes), consistent with the intended block size in v1.4/v1.5/v1.6. *Stated for the current build where `sizeof(Player) = 48` (libstdc++ 64-bit) so `blockSize = 64`; if a platform's `std::string` layout pushed `sizeof(Player)` to `>64`, `blockSize` would round up to `128` and the delta would be `0x80`.*
+2. **Offset math:** The allocation delta between adjacent blocks within a pool is exactly `0x40` (64 bytes), consistent with the intended block size in v1.4/v1.5/v1.6. *Stated for the current build where `sizeof(Player) = 48` (libstdc++ 64-bit) so `blockSize = 64`; if a platform's `std::string` layout pushed `sizeof(Player)` to `>64`, `blockSize` would round up to `128` and the delta would be `0x80`.*
 3. **Free list push-front recycling:** Returned addresses correctly become the new free-list head on the next `allocate()` call, consistent with O(1) LIFO reuse.
 4. **Chunk request striding:** Address gaps between different threads' `CentralArena` sub-chunks were observed at `0x10000` (64KB) intervals, consistent with the fixed `myChunkSize` requested per thread.
 5. **Object lifecycle:** Manual destructor invocation (`p->~Player()`) followed by `deallocate()` correctly releases the `std::string`'s internal heap buffer before the raw block returns to the free list, in the cases exercised by the current demo workloads.
 6. **Dynamic growth (v1.6):** Under a workload exceeding 1023 `Player` objects on a single core, `grow_pool()` claims a second 64KB chunk from `CentralArena` instead of throwing, and the new chunk's free list is spliced onto the old one; `SimpleMemoryPool`'s destructor returns every owned chunk to `CentralArena`'s `freeCentralHead` for reuse.
-7. **Bounds-checked free (v1.6):** A `deallocate()` call with an address in the trailing 64-byte tail padding, or at a non-`blockSize`-aligned offset, is rejected (not inserted into the free list), observable when compiled with `-DPOOL_DEBUG_LOG`.
+7. **Bounds-checked free (v1.6):** A `deallocate()` call with an address in the trailing 64-byte tail padding, or at a non-`blockSize`-aligned offset, is rejected (not inserted into the free list), observable when compiled with `-DPOOL_DEBUG_LOG` / `make debug`.
+8. **Benchmark (v1.7):** See the v1.7 section above — pool beats the system allocator ~2.81× single-threaded and ~1.23× multi-threaded on this machine; the single-threaded run forces `grow_pool()` to execute at runtime.
 
 **Not yet independently verified:**
 * Actual absence of cache-line false sharing between adjacent thread chunks (asserted by design, not measured).
-* Behavior under sustained allocate/deallocate pressure *across multiple growth cycles* — the single-growth case is exercised, but repeated growth/reclaim churn has not been stress-tested.
-* Performance relative to `std::malloc`/`new` — no benchmark has been run yet.
-* Double-free detection — deferred; current `deallocate()` does not catch a valid block freed twice.
+* Latency distribution and long-running growth/reclaim churn — no instrumentation yet.
+* Performance on a workload with mixed object sizes or large objects (only the fixed 48-byte `Player` case is measured).
 
 ---
 
 ## Known Limitations
 
-This project is under active revision. As of the current version (v1.6):
+This project is under active revision. As of the current version (v1.7):
 
-* **Dynamic arena growth:** RESOLVED — `grow_pool()` claims additional 64KB chunks from `CentralArena` on exhaustion instead of throwing (throws only if the arena itself is exhausted).
-* **Chunk reclamation:** RESOLVED — `CentralArena` keeps a `freeCentralHead` recycle list; `SimpleMemoryPool::~SimpleMemoryPool()` returns every owned chunk via `returnChunk()`. `offset` is no longer monotonic.
-* **Deallocation safety checks:** PARTIAL — `deallocate()` now checks chunk membership, block alignment, and the tail-padding region; double-free of a valid block is still not detected.
-* **Hot-path logging:** PARTIAL — gated behind `POOL_DEBUG_LOG` for both the `allocate()`/`deallocate()` logs and the `grow_pool()` init log. There is no separate debug/release CMake/target yet; the split is a single `#ifdef`.
-* **Locking not fully eliminated:** `CentralArena::requestChunk()` takes `arena_mtx` on (a) each thread's one-time bootstrap and (b) every chunk-growth event triggered by `grow_pool()`. The steady-state consume path is lock-free, but growth is not.
-* **No benchmark suite yet:** all "high-performance" framing is currently based on architectural reasoning (lock-free steady-state, cache-line alignment, O(1) free-list operations), not measured throughput/latency numbers.
-* **Huge-type overflow guard only bounds `blockSize`:** `grow_pool()` throws if a single `T` exceeds `myChunkSize - 64` (~64KB), preventing the unsigned-underflow build loop. Types between ~64KB and one slot still fit exactly one block per chunk; this is by design, not a defect.
+* **Dynamic arena growth:** RESOLVED (v1.6) — `grow_pool()` claims additional 64KB chunks on exhaustion.
+* **Chunk reclamation:** RESOLVED (v1.6) — `CentralArena` recycles returned chunks; `offset` is no longer monotonic.
+* **Deallocation safety checks:** PARTIAL (v1.6) — membership + alignment + tail-padding checked; double-free of a valid block still undetected.
+* **Hot-path logging / debug split:** RESOLVED (v1.7) — `make debug` toggles `POOL_DEBUG_LOG`; default `make` is silent Release.
+* **Benchmark:** RESOLVED (v1.7) — `benchmark.cpp` measures vs the system allocator with real numbers (single ~2.81×, multi ~1.23× on this 6-thread machine). Scope is microbenchmark; see v1.7 honest-scope notes.
+* **Locking not fully eliminated:** `CentralArena::requestChunk()` takes `arena_mtx` on (a) each thread's one-time bootstrap and (b) every chunk-growth event. Steady-state consume path is lock-free, but growth is not.
+* **No double-free detection yet:** would need an in-use bitmap; deferred.
+* **No latency / false-sharing / churn instrumentation yet:** throughput-only microbenchmark so far.
 
 ## Next Steps
-1. ~~Add per-thread chunk growth~~ — DONE in v1.6 (`grow_pool()`).
-2. Add a proper debug/release build split (e.g. CMake target / `-DCMAKE_BUILD_TYPE`) so `POOL_DEBUG_LOG` is toggled by the build, not by hand-editing the compile command.
-3. Add a basic benchmark comparing this allocator against `std::malloc`/`new` under single- and multi-threaded load.
-4. Add bounds-checked `deallocate()` — PARTIAL in v1.6 (alignment + tail-padding + membership; double-free still open).
+1. ~~Add per-thread chunk growth~~ — DONE in v1.6.
+2. ~~Add a debug/release build split~~ — DONE in v1.7 (`make debug` vs `make`).
+3. ~~Add a basic benchmark vs std::malloc/new~~ — DONE in v1.7 (`benchmark.cpp`), single ~2.81× / multi ~1.23× on a 6-thread Linux box.
+4. Add bounds-checked `deallocate()` double-free detection (currently PARTIAL in v1.6: alignment + tail-padding + membership; double-free still open).
 5. Consider replacing `CentralArena`'s bootstrap/growth mutex with a lock-free `fetch_add`-based offset claim, if a true fully-lock-free arena (including growth) is a design goal worth the added complexity.
+6. Extend the benchmark beyond the fixed-48-byte regime: mixed sizes, large objects, latency distribution, and sustained growth/reclaim churn.

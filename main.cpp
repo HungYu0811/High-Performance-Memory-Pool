@@ -1,3 +1,7 @@
+// v1.7: POOL_DEBUG_LOG is no longer toggled by a hand-typed -D on the command line.
+// The accompanying CMakeLists.txt defines it automatically for CMAKE_BUILD_TYPE=Debug
+// (and enables -Wall -Wextra); a Release build stays silent and un-instrumented.
+// Keep the #ifdef POOL_DEBUG_LOG guards below as-is — they just react to the build type now.
 #include <iostream>
 #include <cstddef>
 #include <cstdlib>

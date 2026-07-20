@@ -9,7 +9,7 @@
 
 ## Project Overview
 
-An exploration of how to implement a custom, O(1) complexity, thread-aware memory allocator in a multi-threaded C++ environment. The hot-path allocate/deallocate loop is lock-free; a mutex is still used on the cold path (one-time per-thread arena bootstrap). See version notes below for exactly where locking does and doesn't apply.
+An exploration of how to implement a custom, O(1) complexity, thread-aware memory allocator in a multi-threaded C++ environment. The hot-path allocate/deallocate loop is lock-free **while a thread is still consuming blocks from its already-claimed chunk**; a mutex is still taken (a) once per thread on the one-time arena bootstrap, and (b) whenever a thread exhausts its current chunk and `grow_pool()` must claim a new one from `CentralArena`. See version notes below for exactly where locking does and doesn't apply.
 
 ---
 
@@ -97,37 +97,64 @@ An earlier draft of this version used `thread_local SimpleMemoryPool* local_pool
 
 ---
 
+### v1.6 : Debug-Gated Logging + Bounds-Checked Free + Chunk Reclamation + Dynamic Pool Growth
+
+#### Design / Fixes (relative to v1.5):
+1. **Hot-path logging gated behind `POOL_DEBUG_LOG`:** The `std::cout` + `cout_mtx` log blocks inside `allocate()` and `deallocate()` are now wrapped in `#ifdef POOL_DEBUG_LOG`, so a release build (`g++ main.cpp -o main -pthread`, no define) runs the hot path with zero logging overhead. The one-time `[init]` log emitted from `grow_pool()` is *also* gated behind `POOL_DEBUG_LOG`, so a release build produces no pool diagnostic output at all.
+2. **Bounds-checked `deallocate()`:** `deallocate()` now walks `memory_list` and only accepts the address if (a) it falls inside one of the pool's owned chunks, (b) its offset from the chunk base is a multiple of `blockSize` (alignment check — rejects mid-block frees), and (c) that offset is `< myChunkSize - 64` (rejects the trailing 64-byte tail-padding region, which holds no valid block). A misdirected free that fails any of these is silently ignored (`return`) instead of corrupting the free list. Double-free of a *valid* block is still not detected (would require a separate in-use bitmap; deferred as out of scope for a learning project).
+3. **Chunk reclamation — `CentralArena` offset is no longer monotonic:** `CentralArena` now keeps a `freeCentralHead` free list of returned chunks. `SimpleMemoryPool` owns a `std::vector<char*> memory_list` of every chunk it claimed, and its destructor calls `CentralArena::returnChunk(chunk)` for each — pushing the chunk back onto `freeCentralHead`. `requestChunk()` now prefers recycling a returned chunk from `freeCentralHead` before advancing `offset`. This fixes the v1.5 reclamation gap: a thread that exits returns its chunks to the arena for reuse, so `offset` no longer climbs unboundedly in a long-running server that spawns/joins threads.
+4. **Dynamic pool growth — `grow_pool()`:** When `allocate()` finds an empty free list, it calls `grow_pool()`, which requests another 64KB chunk from `CentralArena`, appends it to `memory_list`, builds a fresh embedded free list inside it, and splices that new list's tail onto the previous free list (`current->next = temp_free_list`) — O(1) cross-chunk merge. The pool no longer throws `std::bad_alloc` on exhaustion; it grows instead (only throwing if `CentralArena` itself is out of space).
+
+#### Code-level hardening in v1.6:
+* **Overflow guard added to `grow_pool()`:** `blockSize = (sizeof(T) + 63) & ~63;` is computed *before* any use, and `if (blockSize > myChunkSize - 64) throw std::bad_alloc();` guards the subsequent `maxSlots = (myChunkSize - 64) / blockSize;` loop. This closes the v1.5 latent unsigned-underflow: with `blockSize > myChunkSize - 64` (e.g. a `T` larger than ~64KB), `maxSlots` would have been `0` and `maxSlots - 1` would underflow to `SIZE_MAX`, causing the build loop to scribble past the chunk. The guard is placed *after* `blockSize` is assigned, so the first (constructor) call is protected too — an earlier draft that checked `blockSize` before assigning it read an uninitialized member (UB) and was rejected.
+
+#### Locking characterization in v1.6 (refines the "lock-free" claim):
+* The `allocate()`/`deallocate()` hot path is **lock-free only while the calling thread is still consuming blocks from a chunk it already owns**. The moment a thread exhausts its current chunk and `grow_pool()` runs, it takes `arena_mtx` inside `CentralArena::requestChunk()`. So the correct statement is: *lock-free on the steady-state hot path; mutex-protected on the one-time bootstrap **and** on every chunk-growth event.* It is not "pure lock-free" even in the steady state if growth is happening.
+
+#### Known limitations carried into this version (relative to v1.5):
+* **Resolved:** No dynamic arena growth — now handled by `grow_pool()`.
+* **Resolved:** No chunk reclamation — `CentralArena` now recycles returned chunks via `freeCentralHead`; `offset` is no longer monotonic.
+* **Resolved (partially):** No deallocation safety checks — chunk-membership + alignment + tail-padding checks now applied; double-free of a valid block still undetected.
+* **Resolved (partially):** Hot-path logging — now `POOL_DEBUG_LOG`-gated (both hot-path and `grow_pool` init logs); the debug/release split exists but is a single macro, not a separate build target.
+* **Still open:** No benchmark suite yet — the "High-Performance" framing remains a design-intent claim, not measured.
+
+---
+
 ## Verification & Results
 
 Confirmed via Linux terminal output (`g++ main.cpp -o main -pthread`):
 
 1. **Thread-Local Storage Isolation:** Cores `[0]`, `[1]`, and `[2]` log entirely disjoint memory address ranges (e.g., `0x7f2e68000b60` vs `0x7f2e70000b60`), consistent with each thread receiving its own arena sub-chunk.
-2. **Offset math:** The allocation delta between adjacent blocks within a pool (e.g., `0x7f2e68000ba0 - 0x7f2e68000b60`) is exactly `0x40` (64 bytes), consistent with the intended block size in v1.4/v1.5.
+2. **Offset math:** The allocation delta between adjacent blocks within a pool (e.g., `0x7f2e68000ba0 - 0x7f2e68000b60`) is exactly `0x40` (64 bytes), consistent with the intended block size in v1.4/v1.5/v1.6. *Stated for the current build where `sizeof(Player) = 48` (libstdc++ 64-bit) so `blockSize = 64`; if a platform's `std::string` layout pushed `sizeof(Player)` to `>64`, `blockSize` would round up to `128` and the delta would be `0x80`.*
 3. **Free list push-front recycling:** Returned addresses correctly become the new free-list head on the next `allocate()` call, consistent with O(1) LIFO reuse.
 4. **Chunk request striding:** Address gaps between different threads' `CentralArena` sub-chunks were observed at `0x10000` (64KB) intervals, consistent with the fixed `myChunkSize` requested per thread.
 5. **Object lifecycle:** Manual destructor invocation (`p->~Player()`) followed by `deallocate()` correctly releases the `std::string`'s internal heap buffer before the raw block returns to the free list, in the cases exercised by the current demo workloads.
+6. **Dynamic growth (v1.6):** Under a workload exceeding 1023 `Player` objects on a single core, `grow_pool()` claims a second 64KB chunk from `CentralArena` instead of throwing, and the new chunk's free list is spliced onto the old one; `SimpleMemoryPool`'s destructor returns every owned chunk to `CentralArena`'s `freeCentralHead` for reuse.
+7. **Bounds-checked free (v1.6):** A `deallocate()` call with an address in the trailing 64-byte tail padding, or at a non-`blockSize`-aligned offset, is rejected (not inserted into the free list), observable when compiled with `-DPOOL_DEBUG_LOG`.
 
 **Not yet independently verified:**
 * Actual absence of cache-line false sharing between adjacent thread chunks (asserted by design, not measured).
-* Behavior under sustained allocate/deallocate pressure exceeding a single 64KB chunk per thread (no test currently exercises this, since it would currently throw `std::bad_alloc`).
+* Behavior under sustained allocate/deallocate pressure *across multiple growth cycles* — the single-growth case is exercised, but repeated growth/reclaim churn has not been stress-tested.
 * Performance relative to `std::malloc`/`new` — no benchmark has been run yet.
+* Double-free detection — deferred; current `deallocate()` does not catch a valid block freed twice.
 
 ---
 
 ## Known Limitations
 
-This project is under active revision. As of the current version (v1.5):
+This project is under active revision. As of the current version (v1.6):
 
-* **No dynamic arena growth:** each thread's pool is limited to a single fixed 64KB chunk; exhaustion throws rather than requesting more memory from `CentralArena`.
-* **No chunk reclamation — `CentralArena`'s offset only ever increases:** `requestChunk()` advances `offset` on every call but has no corresponding "give back" operation. `SimpleMemoryPool::~SimpleMemoryPool()` is currently empty — when a thread exits, its 64KB chunk (used or not) is never returned to `CentralArena`, and `CentralArena` has no mechanism to reclaim it even if it wanted to. This is invisible in short-lived demos (the whole 400MB region is `munmap`'d at program exit regardless), but would matter in a long-running server that continuously spawns and joins threads — `offset` would climb monotonically toward the 400MB ceiling even as most of those threads' chunks sit unused after the thread exits.
-* **No deallocation safety checks:** `deallocate()` trusts the caller completely; there is no bounds check against the owning pool's memory range.
-* **Hot-path logging:** `std::cout` calls inside `allocate()`/`deallocate()` are useful for demonstrating correctness but would need to be removed or gated behind a debug flag before any performance claim can be measured meaningfully.
-* **No benchmark suite yet:** all "high-performance" framing is currently based on architectural reasoning (lock-free hot path, cache-line alignment, O(1) free-list operations), not measured throughput/latency numbers.
-* **Locking is not fully eliminated:** `CentralArena::requestChunk()` uses a mutex during each thread's one-time bootstrap. This is intentionally scoped to the cold path, but should not be described as "completely lock-free" without that qualification.
+* **Dynamic arena growth:** RESOLVED — `grow_pool()` claims additional 64KB chunks from `CentralArena` on exhaustion instead of throwing (throws only if the arena itself is exhausted).
+* **Chunk reclamation:** RESOLVED — `CentralArena` keeps a `freeCentralHead` recycle list; `SimpleMemoryPool::~SimpleMemoryPool()` returns every owned chunk via `returnChunk()`. `offset` is no longer monotonic.
+* **Deallocation safety checks:** PARTIAL — `deallocate()` now checks chunk membership, block alignment, and the tail-padding region; double-free of a valid block is still not detected.
+* **Hot-path logging:** PARTIAL — gated behind `POOL_DEBUG_LOG` for both the `allocate()`/`deallocate()` logs and the `grow_pool()` init log. There is no separate debug/release CMake/target yet; the split is a single `#ifdef`.
+* **Locking not fully eliminated:** `CentralArena::requestChunk()` takes `arena_mtx` on (a) each thread's one-time bootstrap and (b) every chunk-growth event triggered by `grow_pool()`. The steady-state consume path is lock-free, but growth is not.
+* **No benchmark suite yet:** all "high-performance" framing is currently based on architectural reasoning (lock-free steady-state, cache-line alignment, O(1) free-list operations), not measured throughput/latency numbers.
+* **Huge-type overflow guard only bounds `blockSize`:** `grow_pool()` throws if a single `T` exceeds `myChunkSize - 64` (~64KB), preventing the unsigned-underflow build loop. Types between ~64KB and one slot still fit exactly one block per chunk; this is by design, not a defect.
 
 ## Next Steps
-1. Add per-thread chunk growth (request additional 64KB chunks from `CentralArena` on exhaustion instead of throwing).
-2. Add a debug/release build split to remove hot-path logging from performance-relevant runs.
+1. ~~Add per-thread chunk growth~~ — DONE in v1.6 (`grow_pool()`).
+2. Add a proper debug/release build split (e.g. CMake target / `-DCMAKE_BUILD_TYPE`) so `POOL_DEBUG_LOG` is toggled by the build, not by hand-editing the compile command.
 3. Add a basic benchmark comparing this allocator against `std::malloc`/`new` under single- and multi-threaded load.
-4. Add bounds-checked `deallocate()` (at minimum in debug builds) to catch misdirected frees early.
-5. Consider replacing `CentralArena`'s bootstrap mutex with a lock-free `fetch_add`-based offset claim, if a true fully-lock-free arena is a design goal worth the added complexity.
+4. Add bounds-checked `deallocate()` — PARTIAL in v1.6 (alignment + tail-padding + membership; double-free still open).
+5. Consider replacing `CentralArena`'s bootstrap/growth mutex with a lock-free `fetch_add`-based offset claim, if a true fully-lock-free arena (including growth) is a design goal worth the added complexity.

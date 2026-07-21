@@ -73,9 +73,9 @@ public:
 
         // v1.6: prefer a previously reclaimed chunk before advancing `offset`. This is what makes
         // the arena reusable across thread spawn/join cycles instead of only ever growing.
-        if (freeCentralHead != nullptr){
+        if (freeCentralHead != nullptr) {
             char* recycledChunk = (char*) freeCentralHead;
-            freeCentralHead = freeCentralHead -> next;
+            freeCentralHead = freeCentralHead->next;
             return recycledChunk;
         }
 
@@ -108,6 +108,7 @@ public:
 
 // Global Central Arena Singleton Instance - Allocating 400MB Virtual Buffer Space
 CentralArena g_centralArena(400 * 1024 * 1024);
+
 /**
  * Template-Based Fixed-Size Memory Pool
  * Automatically scales block sizes to match hardware Cache Line limits based on DataType.
@@ -119,6 +120,13 @@ private:
     // return each one via CentralArena::returnChunk(). Enables chunk reclamation.
     std::vector<char*> memory_list;
 
+    // v1.8: one entry per block, flattened across every chunk this pool owns. A block's global
+    // slot index is `chunk_number * maxSlots + local_index` (see allocate()/deallocate()), so
+    // in_use is laid out as [chunk0's maxSlots entries][chunk1's maxSlots entries]... in the
+    // same order chunks were appended to memory_list. true = block is currently on loan to a
+    // caller; false = block is sitting in the free list (or hasn't been carved out yet).
+    std::vector<bool> in_use;
+
     Node* freeListHead = nullptr;    // Head pointer of the free list tracking available blocks
 
     // v1.6: chunk size is now a member (was a local constant in v1.5) so grow_pool() can reuse it.
@@ -127,6 +135,13 @@ private:
     // v1.6: block size is now a member (computed from sizeof(T) in grow_pool) so deallocate()
     // can validate alignment against the type actually stored.
     size_t blockSize;
+
+    // v1.8: promoted from a grow_pool()-local variable (v1.6/v1.7) to a member, because
+    // allocate()/deallocate() now need it too, to convert a per-chunk local block index into a
+    // flat index into in_use (chunk_number * maxSlots + local_index). Every chunk this pool owns
+    // has the same maxSlots, since myChunkSize and blockSize are both fixed for the pool's
+    // lifetime, so a single member value is valid for every chunk.
+    size_t maxSlots;
 
     // v1.6: dynamically grows the pool by claiming another 64KB chunk from CentralArena instead of
     // throwing. Builds a fresh embedded free list inside the new chunk and splices its tail onto the
@@ -158,7 +173,14 @@ private:
         // Placed AFTER blockSize is assigned so the first (constructor) call is protected too.
         if (blockSize > myChunkSize - 64) throw std::bad_alloc();
 
-        size_t maxSlots = (myChunkSize - 64) / blockSize; // Reserves a conservative 64-byte safe-padding downstream
+        maxSlots = (myChunkSize - 64) / blockSize; // Reserves a conservative 64-byte safe-padding downstream
+
+        // v1.8: this chunk contributes maxSlots new slots to the flattened in_use vector. All start
+        // out free (false) — nothing has been handed out of this chunk yet. Appending (rather than
+        // resizing up front) keeps in_use's size in lockstep with how many chunks actually exist.
+        for (size_t i = 0; i < maxSlots; ++i) {
+            in_use.push_back(false);
+        }
 
         freeListHead = (Node*) memory_list.back();
         Node* current = freeListHead;
@@ -185,8 +207,8 @@ public:
     // instead of leaked until process termination.
     ~SimpleMemoryPool() {
         for (const auto& checkChunks : memory_list){
-          g_centralArena.returnChunk(checkChunks);
-      }
+            g_centralArena.returnChunk(checkChunks);
+        }
     }
 
     // High-speed O(1) memory extraction
@@ -196,6 +218,22 @@ public:
         }
         Node* poppedBlock = freeListHead;
         freeListHead = freeListHead->next;
+
+        // v1.8: mark this block in_use so a future double-free of the same address can be
+        // detected in deallocate(). Walk memory_list to find which chunk poppedBlock belongs to
+        // (same membership test as deallocate()'s bounds check), then convert that chunk-relative
+        // offset into a flat in_use index via chunk_number * maxSlots + local_index.
+        for (size_t i = 0; i < memory_list.size(); ++i) {
+            char* checkChunks = memory_list[i];
+            if ((char*)poppedBlock >= checkChunks && (char*)poppedBlock < (myChunkSize + checkChunks)) {
+                size_t off = (char*)poppedBlock - checkChunks;
+                size_t local_index = off / blockSize;
+                size_t index = i * maxSlots + local_index;
+                in_use[index] = true;
+                break;
+            }
+        }
+
         // v1.6: hot-path diagnostic log is gated behind POOL_DEBUG_LOG (release build = no output)
         #ifdef POOL_DEBUG_LOG
         {
@@ -204,10 +242,8 @@ public:
                       << " -> lend one piece of memory, address : " << (void*)poppedBlock
                       << " | Next memory is at : " << (void*)freeListHead << "\n";
         }
-
         #endif
         return poppedBlock;
-
     }
 
     // High-speed O(1) recycled node pushback
@@ -219,22 +255,43 @@ public:
         //  (b) is block-aligned relative to the chunk base (rejects mid-block frees), and
         //  (c) is not inside the trailing 64-byte tail-padding region (holds no valid block).
         // A misdirected free that fails any check is silently ignored instead of corrupting the free list.
-        // Note: double-free of a *valid* block is still not detected (would need a separate in-use bitmap).
         bool found = false;
-        for (const auto& checkChunks : memory_list){
+        size_t chunk_number = 0;
+        for (size_t i = 0; i < memory_list.size(); ++i){
+            char* checkChunks = memory_list[i];
             if (address >= checkChunks && address < (myChunkSize + checkChunks)) {
                 size_t off = (char*)address - checkChunks;
                 if (off % blockSize == 0
                     && off < (myChunkSize - 64)) {
                     found = true;
+                    chunk_number = i; // v1.8: remember which chunk this address belongs to, needed
+                                       // below to compute its flat in_use index.
                     break;
                 }
             }
         }
-        if(!found) return;
+        if (!found) return;
+
+        // v1.8: convert (chunk_number, address) into a flat in_use index — same formula used in
+        // allocate(): chunk_number * maxSlots + local_index. This lets a single flat vector<bool>
+        // represent every block across every chunk this pool owns, without index collisions
+        // between chunks (each chunk occupies its own maxSlots-wide band in in_use).
+        size_t off = (char*)address - memory_list[chunk_number];
+        size_t local_index = off / blockSize;
+        size_t index = chunk_number * maxSlots + local_index;
+
+        // v1.8: double-free detection. If this block's slot is already marked free (false), the
+        // caller is freeing an address that isn't currently on loan — either a genuine double-free
+        // or a foreign pointer that happened to pass the membership/alignment checks above. Bail
+        // out silently instead of re-inserting the same node into freeListHead a second time, which
+        // would otherwise create a self-referencing cycle in the free list and let a future
+        // allocate() hand out this address to two different callers simultaneously.
+        if (!in_use[index]) return;
+
         Node* returnedBlock = (Node*)address;
         returnedBlock->next = freeListHead;
         freeListHead = returnedBlock;
+        in_use[index] = false; // v1.8: mark free only after the double-free check passes.
 
         // v1.6: hot-path diagnostic log gated behind POOL_DEBUG_LOG
         #ifdef POOL_DEBUG_LOG
@@ -313,10 +370,9 @@ void game_core_worker(int core_id, std::vector<UserRequest> requests) {
 }
 int main() {
 
-
     cout << "=== Start Dynamically Scaled Game Server, Preparing Cores ===\n\n";
 
-    // 💡 Simulating dynamic user load profiles on different cores
+    // Simulating dynamic user load profiles on different cores
     std::vector<UserRequest> core0_payload = {
         {101, 100, 50, "Dynamic_Leo"},
         {102, 120, 60, "Dynamic_Vicky"}

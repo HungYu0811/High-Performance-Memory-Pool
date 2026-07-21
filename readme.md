@@ -173,6 +173,32 @@ An earlier draft of this version used `thread_local SimpleMemoryPool* local_pool
 
 ---
 
+### v1.8 : Double-Free Detection via a Flattened In-Use Bitmap
+
+#### Design / Changes (relative to v1.7):
+1. **Per-block in-use tracking:** Added `std::vector<bool> in_use` as a member of `SimpleMemoryPool<T>`. Unlike `freeListHead`'s embedded-pointer trick, this state cannot live inside the block itself — a block that's currently on loan holds live caller data (e.g. a constructed `Player`), so there's no spare space inside it to also store a flag without corrupting that data. `in_use` is therefore a separate, out-of-band vector.
+2. **Flattened indexing across chunks:** A pool may own multiple chunks (via `grow_pool()`, v1.6). `in_use` is laid out as one contiguous vector spanning all of them: chunk 0's `maxSlots` blocks occupy indices `[0, maxSlots)`, chunk 1's occupy `[maxSlots, 2*maxSlots)`, and so on. A block's flat index is computed as `chunk_number * maxSlots + local_index`, where `local_index = off / blockSize` (the same per-chunk offset math already used by v1.6's alignment check) and `chunk_number` is the position of the owning chunk within `memory_list`.
+3. **`maxSlots` promoted to a member:** Previously a `grow_pool()`-local variable (v1.6/v1.7), `maxSlots` is now a class member, since `allocate()` and `deallocate()` both need it to convert a per-chunk local index into `in_use`'s flat index. This is safe because `myChunkSize` and `blockSize` are fixed for the pool's lifetime, so every chunk the pool owns has an identical `maxSlots`.
+4. **`grow_pool()` extends `in_use` on every growth event:** After computing `maxSlots` for a newly claimed chunk, `grow_pool()` appends `maxSlots` fresh `false` entries to `in_use` — one per block in the new chunk, all initially free. This keeps `in_use`'s size in lockstep with however many chunks currently exist, rather than pre-sizing for a chunk count decided up front.
+5. **`allocate()` marks a block in-use:** After popping a block off `freeListHead`, `allocate()` walks `memory_list` (same membership test as `deallocate()`'s bounds check) to find which chunk the popped block belongs to, computes its flat `in_use` index, and sets it to `true`.
+6. **`deallocate()` rejects a double-free:** After the existing v1.6 bounds/alignment checks pass, `deallocate()` computes the flat index and checks `in_use[index]`. If it's already `false` — meaning this block isn't currently on loan to anyone — the call is a double-free (or a foreign pointer that coincidentally passed the earlier checks) and is silently rejected (`return`) without touching `freeListHead`. Only if the check passes does the function splice the block onto `freeListHead` and then set `in_use[index] = false`; the check must run *before* the splice, and the flag must be cleared *after* it, or the check would just be checking a flag it had already zeroed itself.
+
+#### Why this matters:
+Without this check, freeing the same valid address twice inserts it into `freeListHead` twice. The free list would then contain a self-referencing cycle, and a subsequent `allocate()` could hand out the *same* address to two different callers simultaneously — two live objects silently aliasing one block, each unaware the other exists, corrupting each other's state the moment either one writes to it.
+
+#### Verified (hand-tested):
+* **Alignment check (carried over from v1.7, re-verified in v1.8):** `deallocate()` called with a legitimately-borrowed address offset by +1 byte is rejected — confirmed by borrowing again immediately afterward and observing the next `allocate()` returns the *next* free-list block (base + `blockSize`), not the poisoned +1 address, proving the misaligned address was never spliced into `freeListHead`.
+* **Overflow guard (carried over from v1.7, re-verified in v1.8):** Constructing `SimpleMemoryPool<T>` for a `T` whose `sizeof(T)` exceeds `myChunkSize - 64` (tested with a 100,000-byte struct) throws `std::bad_alloc` from inside `grow_pool()`, before `maxSlots` is ever computed — confirming the guard prevents the `size_t` underflow that would otherwise drive the block-splitting loop past the chunk's bounds.
+* **Double-free detection:** Allocated one block (`p`), freed it once (legal), then freed it a second time (double-free). Then allocated twice more (`first`, `second`) and compared addresses:
+  * `first == p` — expected regardless of the fix, since the first (legal) free correctly returned `p` to `freeListHead`.
+  * `second == p + blockSize` (the normal next free-list entry), **not** `second == p`. Had the double-free not been caught, `p` would have been spliced into `freeListHead` twice, and `second` would have come back equal to `p` again instead of advancing to the next block. The observed result confirms the second `deallocate(p)` call was silently rejected and never touched the free list.
+
+#### Known limitations carried into this version (relative to v1.7):
+* **Resolved:** No double-free detection — `in_use` now catches a double-free of any block still tracked by this pool.
+* **Still open, by design:** `in_use` only detects a double-free *of a block this pool actually owns and that passes the v1.6 bounds/alignment checks*. A foreign pointer that fails membership or alignment is already rejected by those earlier checks (as before v1.8) and never reaches the `in_use` lookup — this is existing, unchanged behavior, not a new gap.
+* **Not addressed:** `CentralArena::requestChunk()`/`returnChunk()` still take `arena_mtx` on bootstrap and every chunk-growth event (unchanged from v1.6/v1.7). A proposal to replace this with a lock-free `fetch_add`/CAS-stack design was considered for this version and deliberately deferred — the naive version of that change (swapping the mutex for `compare_exchange_weak` on a raw-pointer stack) is vulnerable to the ABA problem and would need hazard pointers or a tagged/versioned pointer scheme to be done safely. That's a substantially harder, separately-scoped piece of work and is being left for a future version rather than rushed in alongside v1.8.
+* **`in_use` adds a small per-block memory cost:** `std::vector<bool>` is bit-packed (1 bit per block, not 1 byte), so the overhead is small relative to `blockSize` (64 bytes), but it is a departure from the pool's original "zero metadata" design philosophy (v1.0–v1.5 stored no per-block state at all, only the embedded free-list pointer). This is a deliberate, documented trade-off: some out-of-band state is unavoidable once double-free detection is a goal, since (as established above) there's no spare room inside a live block to store it in-band.
+
 ## Verification & Results
 
 Confirmed via Linux terminal output (`g++ main.cpp -o main -pthread`):
@@ -185,6 +211,7 @@ Confirmed via Linux terminal output (`g++ main.cpp -o main -pthread`):
 6. **Dynamic growth (v1.6):** Under a workload exceeding 1023 `Player` objects on a single core, `grow_pool()` claims a second 64KB chunk from `CentralArena` instead of throwing, and the new chunk's free list is spliced onto the old one; `SimpleMemoryPool`'s destructor returns every owned chunk to `CentralArena`'s `freeCentralHead` for reuse.
 7. **Bounds-checked free (v1.6):** A `deallocate()` call with an address in the trailing 64-byte tail padding, or at a non-`blockSize`-aligned offset, is rejected (not inserted into the free list), observable when compiled with `-DPOOL_DEBUG_LOG` / `make debug`.
 8. **Benchmark (v1.7):** See the v1.7 section above — pool beats the system allocator ~2.81× single-threaded and ~1.23× multi-threaded on this machine; the single-threaded run forces `grow_pool()` to execute at runtime.
+9. **Double-free detection (v1.8):** A `deallocate()` call on a valid, block-aligned address that has *already* been freed once is rejected on the second call. Verified by allocating one block (`p`), freeing it twice, then allocating twice more: the first subsequent allocation correctly returns `p` (expected — the first free was legal), but the second returns the *next* free-list block (`p + blockSize`) rather than `p` itself — confirming the second `deallocate(p)` never re-spliced `p` into `freeListHead`. If the check had not fired, both subsequent allocations would have returned `p`.
 
 **Not yet independently verified:**
 * Actual absence of cache-line false sharing between adjacent thread chunks (asserted by design, not measured).
@@ -195,21 +222,23 @@ Confirmed via Linux terminal output (`g++ main.cpp -o main -pthread`):
 
 ## Known Limitations
 
-This project is under active revision. As of the current version (v1.7):
+This project is under active revision. As of the current version (v1.8):
 
 * **Dynamic arena growth:** RESOLVED (v1.6) — `grow_pool()` claims additional 64KB chunks on exhaustion.
 * **Chunk reclamation:** RESOLVED (v1.6) — `CentralArena` recycles returned chunks; `offset` is no longer monotonic.
-* **Deallocation safety checks:** PARTIAL (v1.6) — membership + alignment + tail-padding checked; double-free of a valid block still undetected.
+* **Deallocation safety checks:** RESOLVED (v1.6 + v1.8) — membership, alignment, and tail-padding checked since v1.6; double-free of a valid block now also checked since v1.8 via the flattened `in_use` bitmap.
 * **Hot-path logging / debug split:** RESOLVED (v1.7) — `make debug` toggles `POOL_DEBUG_LOG`; default `make` is silent Release.
-* **Benchmark:** RESOLVED (v1.7) — `benchmark.cpp` measures vs the system allocator with real numbers (single ~2.81×, multi ~1.23× on this 6-thread machine). Scope is microbenchmark; see v1.7 honest-scope notes.
-* **Locking not fully eliminated:** `CentralArena::requestChunk()` takes `arena_mtx` on (a) each thread's one-time bootstrap and (b) every chunk-growth event. Steady-state consume path is lock-free, but growth is not.
-* **No double-free detection yet:** would need an in-use bitmap; deferred.
+* **Benchmark:** RESOLVED (v1.7) — `benchmark.cpp` measures vs the system allocator with real numbers (single ~2.81×, multi ~1.23× on this 6-thread machine). Scope is microbenchmark; see v1.7 honest-scope notes. **Not yet re-run against v1.8** — the `in_use` bookkeeping added to the `allocate()`/`deallocate()` hot path has not been benchmarked for overhead (see Next Steps #7).
+* **Locking not fully eliminated:** `CentralArena::requestChunk()` takes `arena_mtx` on (a) each thread's one-time bootstrap and (b) every chunk-growth event. Steady-state consume path is lock-free, but growth is not. A `fetch_add`/CAS-based lock-free redesign was considered for v1.8 and deliberately deferred — see the v1.8 section above for why (ABA problem).
+* **No double-free detection yet:** RESOLVED (v1.8) — see the v1.8 section above. Note the scope: `in_use` only catches a double-free of a block that already passes the v1.6 membership/alignment checks; a foreign or misaligned pointer is rejected earlier, as before.
 * **No latency / false-sharing / churn instrumentation yet:** throughput-only microbenchmark so far.
+* **`in_use` departs from the pool's original zero-metadata design:** v1.0–v1.5 stored no per-block state at all. v1.8 introduces one bit of out-of-band state per block to make double-free detection possible — a deliberate, documented trade-off, not an oversight.
 
 ## Next Steps
 1. ~~Add per-thread chunk growth~~ — DONE in v1.6.
 2. ~~Add a debug/release build split~~ — DONE in v1.7 (`make debug` vs `make`).
 3. ~~Add a basic benchmark vs std::malloc/new~~ — DONE in v1.7 (`benchmark.cpp`), single ~2.81× / multi ~1.23× on a 6-thread Linux box.
-4. Add bounds-checked `deallocate()` double-free detection (currently PARTIAL in v1.6: alignment + tail-padding + membership; double-free still open).
-5. Consider replacing `CentralArena`'s bootstrap/growth mutex with a lock-free `fetch_add`-based offset claim, if a true fully-lock-free arena (including growth) is a design goal worth the added complexity.
+4. ~~Add bounds-checked `deallocate()` double-free detection~~ — DONE in v1.8 (flattened `in_use` bitmap; membership + alignment + tail-padding + double-free all now checked).
+5. Consider replacing `CentralArena`'s bootstrap/growth mutex with a lock-free `fetch_add`-based offset claim, if a true fully-lock-free arena (including growth) is a design goal worth the added complexity. **Note (v1.8):** a naive `compare_exchange_weak`-based free-chunk stack is vulnerable to ABA; a real implementation needs hazard pointers or tagged pointers, not just a mutex-to-CAS swap.
 6. Extend the benchmark beyond the fixed-48-byte regime: mixed sizes, large objects, latency distribution, and sustained growth/reclaim churn.
+7. Re-benchmark v1.8 against v1.7 to quantify the cost (if any) of the `in_use` bookkeeping added to the `allocate()`/`deallocate()` hot path.

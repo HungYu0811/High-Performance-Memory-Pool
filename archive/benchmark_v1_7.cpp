@@ -1,14 +1,7 @@
-// v1.8 benchmark: measures the pool allocator against the system allocator
+// v1.7 benchmark: measures the pool allocator against the system allocator
 // (std::malloc / default operator new) under single- and multi-threaded load,
 // and deliberately exceeds a single 64KB chunk per thread to exercise the
 // v1.6 dynamic-growth path.
-//
-// v1.8 change from the v1.7 benchmark: SimpleMemoryPool below now carries the
-// same in_use/maxSlots/double-free-detection logic as main.cpp, so this
-// benchmark measures the actual v1.8 pool (including the double-free check's
-// hot-path cost), not the older v1.6-era pool. This lets v1.8's numbers be
-// compared directly against the v1.7 numbers already recorded in the README
-// to quantify the cost of double-free detection.
 //
 // Build:  cmake -DCMAKE_BUILD_TYPE=Release .. && cmake --build .
 // Run:    ./benchmark            (or benchmark.exe on Windows)
@@ -79,31 +72,21 @@ public:
 };
 static CentralArena g_centralArena(400 * 1024 * 1024);
 
-// v1.8: in_use/maxSlots added below, matching main.cpp exactly, so this
-// benchmark's allocate()/deallocate() pay the same double-free-detection
-// cost as the real pool.
 template <typename T>
 class SimpleMemoryPool {
 private:
     std::vector<char*> memory_list;
-    std::vector<bool> in_use;
     Node* freeListHead = nullptr;
     size_t myChunkSize;
     size_t blockSize;
-    size_t maxSlots;
-
     void grow_pool() {
         Node* temp = freeListHead;
         char* newChunk = g_centralArena.requestChunk(myChunkSize);
         if (!newChunk) throw std::bad_alloc();
         memory_list.push_back(newChunk);
-
         blockSize = (sizeof(T) + 63) & ~63;
         if (blockSize > myChunkSize - 64) throw std::bad_alloc();
-
-        maxSlots = (myChunkSize - 64) / blockSize;
-        for (size_t i = 0; i < maxSlots; ++i) in_use.push_back(false);
-
+        size_t maxSlots = (myChunkSize - 64) / blockSize;
         freeListHead = (Node*)memory_list.back();
         Node* cur = freeListHead;
         for (size_t i = 0; i < maxSlots - 1; ++i) {
@@ -115,6 +98,7 @@ private:
 public:
     SimpleMemoryPool() {
         myChunkSize = 64 * 1024;
+        blockSize = (sizeof(T) + 63) & ~63;
         grow_pool();
     }
     ~SimpleMemoryPool() {
@@ -124,46 +108,21 @@ public:
         if (!freeListHead) grow_pool();
         Node* p = freeListHead;
         freeListHead = freeListHead->next;
-
-        // v1.8: mark this block in-use (same logic as main.cpp).
-        for (size_t i = 0; i < memory_list.size(); ++i) {
-            char* c = memory_list[i];
-            if ((char*)p >= c && (char*)p < c + myChunkSize) {
-                size_t off = (char*)p - c;
-                size_t local_index = off / blockSize;
-                in_use[i * maxSlots + local_index] = true;
-                break;
-            }
-        }
         return p;
     }
     void deallocate(void* a) {
         if (!a) return;
         bool found = false;
-        size_t chunk_number = 0;
-        for (size_t i = 0; i < memory_list.size(); ++i) {
-            char* c = memory_list[i];
+        for (auto c : memory_list) {
             if (a >= c && a < c + myChunkSize) {
                 size_t off = (char*)a - c;
-                if (off % blockSize == 0 && off < myChunkSize - 64) {
-                    found = true;
-                    chunk_number = i;
-                    break;
-                }
+                if (off % blockSize == 0 && off < myChunkSize - 64) { found = true; break; }
             }
         }
         if (!found) return;
-
-        // v1.8: double-free check (same logic as main.cpp).
-        size_t off = (char*)a - memory_list[chunk_number];
-        size_t local_index = off / blockSize;
-        size_t index = chunk_number * maxSlots + local_index;
-        if (!in_use[index]) return;
-
         Node* r = (Node*)a;
         r->next = freeListHead;
         freeListHead = r;
-        in_use[index] = false;
     }
 };
 
@@ -242,7 +201,7 @@ int main() {
     size_t single_iters   = 20000;          // 20000 Players > 1023 slots per 64KB chunk
     size_t multi_iters    = 50000;          // per thread
 
-    std::cout << "=== High-Performance Memory Pool — v1.8 benchmark ===\n";
+    std::cout << "=== High-Performance Memory Pool — v1.7 benchmark ===\n";
     std::cout << "hardware threads: " << hw << "\n\n";
 
     std::cout << "[A] single-threaded (forces cross-chunk growth)\n";

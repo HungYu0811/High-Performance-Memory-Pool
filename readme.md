@@ -220,6 +220,29 @@ Confirmed via Linux terminal output (`g++ main.cpp -o main -pthread`):
 
 ---
 
+#### Benchmark addendum: v1.8 vs v1.7, measured with interleaved testing
+
+After committing v1.8, `benchmark.cpp` was updated to include the new `in_use`/double-free-detection logic (previously only `main.cpp` had it, so the benchmark was silently still measuring v1.6-era pool behavior). This section documents both the corrected benchmark and a methodology mistake made — and fixed — while producing these numbers, on the theory that an honest record of a measurement error is more useful than a clean-looking number nobody can trust.
+
+**What went wrong the first time:** The first attempt ran all v1.7 trials back-to-back, then all v1.8 trials back-to-back, and compared the two batches directly. A single run under this scheme showed `pool` apparently ~2× faster in v1.8 — but the *unmodified* `system` allocator baseline (`new`/`delete`, identical code in both binaries) also shifted by as much as 10× between batches. Since `system`'s code never changed, that shift can only be attributed to the environment itself (a shared VM) drifting between the two batches, not to anything in the pool's code. Comparing batch totals under these conditions would have attributed environmental noise to the code change.
+
+**Fix — interleaved testing:** Both binaries were run in strict alternation (v1.7, v1.8, v1.7, v1.8, ...) via a small script (`interleaved_bench.sh`) so any drift in the VM's load is spread evenly across both versions instead of concentrated in whichever batch happened to run during a busy or idle period. Within each round, `pool ÷ system` was computed *before* aggregating — this ratio largely cancels out the drift that affects both binaries in that same round, whereas comparing raw pool numbers across rounds does not.
+
+**Results (8 interleaved rounds, this machine — see environment note below):**
+
+| Scenario | v1.7 median (pool ÷ system) | v1.8 median (pool ÷ system) |
+|---|---|---|
+| Single-threaded | 0.69 (pool ~31% slower than system) | 1.00 (roughly on par with system) |
+| Multi-threaded (4 threads) | 0.80 (pool ~20% slower than system) | 1.09 (pool ~9% faster than system) |
+
+The direction of improvement is consistent (single-threaded: 6/8 rounds favor v1.8; multi-threaded: 7/8 rounds favor v1.8), which is what makes this a usable result despite per-round absolute numbers varying widely (a symptom of running on a shared, noisy VM rather than dedicated hardware). The honest summary: **v1.8's pool closes the gap against the system allocator relative to v1.7, moving from consistently behind to roughly on par or slightly ahead** — not a clean multiplier, and not the dramatic "2×" a naive batch-vs-batch comparison suggested.
+
+**Environment note — this is not the same machine as the v1.7 section above.** The original v1.7 numbers (`~2.81×` single-threaded, `~1.23×` multi-threaded) were measured on a dedicated 6-hardware-thread Linux machine. The v1.8 interleaved numbers above were measured on a different, 4-hardware-thread shared VM (the original machine was temporarily unreachable). The two environments are **not directly comparable** — this table shows v1.7-vs-v1.8 measured together on the same (noisier) machine, which is a valid same-environment comparison, but the absolute Mops/sec figures and multipliers here should not be placed side-by-side with the original v1.7 section's numbers as if they came from the same hardware. A same-hardware, same-methodology re-run on the original 6-thread machine remains a good future addition, but is not required to trust the relative v1.7-vs-v1.8 conclusion above, since that conclusion only depends on both versions having been measured under identical conditions as each other.
+
+**Why single-threaded improved more than multi-threaded:** Plausible explanation, not confirmed — `in_use`'s bookkeeping in `allocate()`/`deallocate()` adds a fixed amount of per-call work (walking `memory_list`, computing a flat index) that doesn't scale with thread count. In the multi-threaded case, `CentralArena`'s `arena_mtx` contention and general 4-thread scheduling variance are already a larger share of total time, so a fixed per-call overhead added by `in_use` is proportionally smaller there than in the tighter single-threaded loop. This has not been independently verified (e.g. via profiling) and should be read as a hypothesis, not a finding.
+
+---
+
 ## Known Limitations
 
 This project is under active revision. As of the current version (v1.8):

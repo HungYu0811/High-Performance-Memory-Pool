@@ -115,7 +115,6 @@ private:
     Node* freeListHead = nullptr;
     size_t myChunkSize;
     size_t blockSize;
-
     void grow_pool() {
         Node* temp = freeListHead;
         char* newChunk = g_centralArena.requestChunk(myChunkSize);
